@@ -4,4 +4,4 @@ build:
 	jenga -progress
 
 p:
-	jenga -P -progress
+	jenga -P -progress .runtest .DEFAULT
