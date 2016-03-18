@@ -4,13 +4,16 @@ open Jenga_lib.Api
 let ( *>>= ) = Dep.bind
 let ( *>>| ) = Dep.map
 
-let message str = print_endline ("!!jengaroot.ml: " ^ str)
-let _ = message
-
 let (^/) dir name = Path.relative ~dir name
 let (/^) = (^/)
 
-let ocamlfind_wrap = "ocamlfind"
+let ocamlfind = "ocamlfind"
+let ocamlc_prog     = "ocamlc"
+let ocamlopt_prog     = "ocamlopt"
+
+(*
+ let message fmt = ksprintf (fun s -> Core.Std.Printf.printf "!!JengaRoot.ml : %s\n%!" s) fmt
+ *)
 
 let basename = Path.basename
 
@@ -120,8 +123,8 @@ module Ocaml = struct
     ]
     
 
-  let ocamlopt ~dir ~external_libraries ~foreign_libraries ~for_pack
-        ~include_dirs ~args ~allow_unused_opens ~pp_args =
+  let ocamlcompile ~dir ~external_libraries ~foreign_libraries ~for_pack
+        ~include_dirs ~args ~allow_unused_opens ~pp_args name =
           let packages_args  =
             match external_libraries with
       | [] -> []
@@ -156,10 +159,15 @@ module Ocaml = struct
     let cmt_args =
       ["-bin-annot"; "-g"]
     in
-    let args = (List.concat [ ["ocamlopt"; "-thread"]; args; packages_args; pack_args; include_args
+    let args = (List.concat [ [name; "-thread"]; args; packages_args; pack_args; include_args
                          ; foreign_args; warning_args; syntax_args; cmt_args]) in
-    Action.process ~dir ~prog:ocamlfind_wrap ~args
+    Action.process ~dir ~prog:ocamlfind ~args
   
+  let ocamlopt ~dir ~external_libraries ~foreign_libraries ~for_pack ~include_dirs ~args ~allow_unused_opens ~pp_args =
+    ocamlcompile ~dir ~external_libraries ~foreign_libraries ~for_pack ~include_dirs ~args ~allow_unused_opens ~pp_args ocamlopt_prog
+  
+  let ocamlc ~dir ~external_libraries ~foreign_libraries ~for_pack ~include_dirs ~args ~allow_unused_opens ~pp_args =
+    ocamlcompile ~dir ~external_libraries ~foreign_libraries ~for_pack ~include_dirs ~args ~allow_unused_opens ~pp_args ocamlc_prog 
 
   let ocamldep ~dir ~args =
     let packages_args =
@@ -168,7 +176,7 @@ module Ocaml = struct
     let syntax_args =
       ["-syntax"; "camlp4o"]
     in
-    Action.process ~dir ~prog:ocamlfind_wrap
+    Action.process ~dir ~prog:ocamlfind
       ~args:(List.concat [ ["ocamldep"]; args; packages_args; syntax_args
       ])
   
@@ -293,11 +301,17 @@ module Ocaml = struct
   
 
   let compiled_files_for ~dir names =
+    let libname = (basename dir) ^ "_lib" in
     List.concat_map names ~f:(fun name ->
       [ Dep.path (dir ^/ name ^ ".cmx")
       ; Dep.path (dir ^/ name ^ ".cmi")
       ; Dep.path (dir ^/ name ^ ".o")
-      ]) 
+      ]
+      @ 
+      match ((String.equal name "inline_tests_runner") || (String.equal name libname)) with
+      | true -> []
+      | false -> [Dep.path (dir ^/ name ^ ".cmo")]
+    )
   
 
   let toposort ~targets deps =
@@ -373,6 +387,68 @@ module Ocaml = struct
           in
           (String.Table.of_alist_exn deps, `External external_libraries)
   
+(*----------------------------------------------------------------------
+ bash
+ ----------------------------------------------------------------------*)
+  let shell_escape s =
+    "'" ^ String.concat_map s ~f:(function
+      | '\'' -> "'\\''"
+    | c -> String.make 1 c
+  ) ^ "'"
+
+
+  let bash ~dir command_string =
+    Action.process ~dir ~prog:"bash" ~args:[
+      "-e"; "-u"; "-o"; "pipefail";
+    "-c"; command_string
+    ]
+
+  module Bash : sig
+    type t
+    val create : prog:string -> args:string list -> target:string option -> t
+    val action: dir:Path.t -> t list -> Action.t
+  end = struct
+    type t = string
+
+    let create ~prog ~args ~target =
+      let com = String.concat ~sep:" "
+        (prog :: List.map args ~f:shell_escape)
+      in
+      match target with
+      | None -> com
+      | Some target -> sprintf "%s > %s" com target
+
+    let action ~dir ts =
+      let command_string = String.concat ~sep:"; " ts in
+      bash ~dir command_string
+  end
+
+  let bash1 ?target prog args = Bash.create ~prog ~args ~target
+
+  let echo_string ~target string =
+    bash1 ~target "echo" ["-e"; string]
+
+    (* basic action for writing strings to files *)
+  let write_string_action ?chmod_x string ~target =
+    let dir = Path.dirname target in
+    Bash.action ~dir ([
+      echo_string ~target:(basename target) string
+    ] @ (
+      match chmod_x with | None -> [] | Some () ->
+        [bash1 "chmod" ["+x"; basename target]]
+      ))
+
+  let create1 ~targets ~deps ~action =
+    Rule.create ~targets (
+      Dep.all_unit deps *>>| fun () -> action
+      )
+  let write_string_rule ?chmod_x string ~target =
+    create1 ~deps:[] ~targets:[target]
+    ~action:(write_string_action ?chmod_x string ~target)
+
+  let bashf ~dir fmt =
+    ksprintf (fun str -> bash ~dir str) fmt
+
 
   let link_exe_rule ~dir ~libraries ~external_libraries ~foreign_libraries ~classic_libs ~exe names =
     let link_exe =
@@ -452,6 +528,7 @@ module Ocaml = struct
     let lib_o = dir ^/ Lib.suffixed_name lib ^ ".o" in
     let lib_cmx = dir ^/ Lib.suffixed_name lib ^ ".cmx" in
     let lib_cmi = dir ^/ Lib.suffixed_name lib ^ ".cmi" in
+    let lib_cma = dir ^/ Lib.suffixed_name lib ^ ".cma" in
     let libpath = Liblinks.lib_dir_path ~lib in
     let link_cmxa =
       Dep.all_unit (List.map ~f:Dep.path [lib_cmx; lib_cmi; lib_o])
@@ -473,10 +550,23 @@ module Ocaml = struct
                  ])
         ~pp_args:[]
     in
+    let pack_lib_cma =
+      Dep.all_unit (compiled_files_for ~dir names)
+      *>>= fun () -> 
+        toposort_deps ~dir (List.map names ~f:(fun name -> name ^ ".cmo"))
+      *>>| fun cmos ->
+          ocamlc ~dir ~external_libraries ~allow_unused_opens:false
+        ~for_pack:None ~include_dirs:[] ~foreign_libraries:[]
+        ~args:(List.concat
+                 [ ["-pack"; "-o"; basename lib_cma]
+                 ; cmos
+                 ])
+        ~pp_args:[]
+    in
     [ Rule.create ~targets:[lib_cmxa; lib_a] link_cmxa
     ; Rule.create ~targets:[lib_cmx; lib_cmi; lib_o] pack_lib_cmx
+    ; Rule.create ~targets:[lib_cma;] pack_lib_cma
     ]
-  
 
   let compile_ml ~dir ~name ~external_libraries ~libraries ~for_pack ~include_dirs ~cmx =
     let ml = dir ^/ name ^ ".ml" in
@@ -494,6 +584,42 @@ module Ocaml = struct
       ~args:["-c"; basename ml]
       ~pp_args
   
+  let byte_compile_ml ~dir ~name ~external_libraries ~for_pack ~include_dirs ~cmo =
+    let ml = dir ^/ name ^ ".ml" in
+    Dep.path ml
+    *>>= fun () ->
+      deps_paths ~dir ~source:ml ~target:cmo
+    *>>| fun () ->
+    (* If there is no .mli file, then the default behaviour of the byte-compiler (ocamlc) is
+       to generate a .cmi file. We DONT want this, because our rules are setup so the .cmi
+       is generated from the native-compiler.
+
+       If the native & byte compilers run at the same time, we may get a corrupted .cmi file
+
+       To prevent the byte-compiler from writing the .cmi we use a -o directive to get
+       generated outputs with a different basename & then rename the output we want (the
+       .cmo) back to the original basename.
+
+       Even if there is an .mli, the same problem happens because of cmt files, so the
+       bytecode compilation always happens in a subdirectory. *)
+      let lib = Lib.of_name (basename dir) in
+      let libname = Lib.suffixed_name lib in
+      let pp_args = ["-thread"; "-ppopt"; "-pa-ounit-lib"; "-ppopt"; libname] in
+      ocamlc ~dir ~external_libraries ~include_dirs ~for_pack
+      ~foreign_libraries:[] ~allow_unused_opens:false
+      ~args:[
+          "-o"; basename cmo;
+          "-c"; basename ml; 
+      ]
+      ~pp_args
+      
+
+  let byte_compile_ml_rule ~dir ~libraries ~external_libraries ~for_pack name =
+    let cmo = dir ^/ name ^ ".cmo" in
+    let include_dirs = Liblinks.include_dirs ~dir libraries in
+
+    Rule.create ~targets:[cmo]
+    (byte_compile_ml ~dir ~name ~external_libraries ~for_pack ~include_dirs ~cmo)
 
   let compile_ml_rule ~dir ~libraries ~external_libraries ~for_pack name =
     let cmi = dir ^/ name ^ ".cmi" in
@@ -530,8 +656,7 @@ module Ocaml = struct
         ~args:["-c"; basename mli]
         ~pp_args:[]
       in
-      let compile_ml = compile_ml ~dir ~name ~external_libraries ~libraries ~for_pack ~include_dirs ~cmx
-      in
+      let compile_ml = compile_ml ~dir ~name ~external_libraries ~libraries ~for_pack ~include_dirs ~cmx in
       [ Rule.create ~targets:[cmx; o] compile_ml 
       ; Rule.create ~targets:[cmi] compile_mli
       ]
@@ -550,8 +675,11 @@ module Ocaml = struct
     let rules =
       List.concat_map names ~f:(fun name ->
         if List.mem mlis (dir ^/ name ^ ".mli")
-        then compile_ml_mli_rules ~dir ~libraries ~external_libraries ~for_pack name
-        else [compile_ml_rule ~dir ~libraries ~external_libraries ~for_pack name])
+        then compile_ml_mli_rules ~dir ~libraries ~external_libraries ~for_pack name @
+              [byte_compile_ml_rule ~dir ~libraries ~external_libraries ~for_pack name]
+        else [compile_ml_rule ~dir ~libraries ~external_libraries ~for_pack name;
+              byte_compile_ml_rule ~dir ~libraries ~external_libraries ~for_pack name;
+            ])
     in
     (names, rules)
   
@@ -571,70 +699,6 @@ module Ocaml = struct
       ]
     ]
   
-
-  (*----------------------------------------------------------------------
- bash
- ----------------------------------------------------------------------*)
-  let shell_escape s =
-    "'" ^ String.concat_map s ~f:(function
-      | '\'' -> "'\\''"
-    | c -> String.make 1 c
-  ) ^ "'"
-
-
-  let bash ~dir command_string =
-    Action.process ~dir ~prog:"bash" ~args:[
-      "-e"; "-u"; "-o"; "pipefail";
-    "-c"; command_string
-    ]
-
-    module Bash : sig
-      type t
-      val create : prog:string -> args:string list -> target:string option -> t
-  val action: dir:Path.t -> t list -> Action.t
-
-end = struct
-
-  type t = string
-
-  let create ~prog ~args ~target =
-    let com = String.concat ~sep:" "
-      (prog :: List.map args ~f:shell_escape)
-    in
-    match target with
-    | None -> com
-    | Some target -> sprintf "%s > %s" com target
-
-  let action ~dir ts =
-    let command_string = String.concat ~sep:"; " ts in
-    bash ~dir command_string
-    end
-
-  let bash1 ?target prog args = Bash.create ~prog ~args ~target
-
-  let echo_string ~target string =
-    bash1 ~target "echo" ["-e"; string]
-
-    (* basic action for writing strings to files *)
-  let write_string_action ?chmod_x string ~target =
-    let dir = Path.dirname target in
-    Bash.action ~dir ([
-      echo_string ~target:(basename target) string
-    ] @ (
-      match chmod_x with | None -> [] | Some () ->
-        [bash1 "chmod" ["+x"; basename target]]
-      ))
-
-  let create1 ~targets ~deps ~action =
-    Rule.create ~targets (
-      Dep.all_unit deps *>>| fun () -> action
-      )
-  let write_string_rule ?chmod_x string ~target =
-    create1 ~deps:[] ~targets:[target]
-    ~action:(write_string_action ?chmod_x string ~target)
-
-  let bashf ~dir fmt =
-    ksprintf (fun str -> bash ~dir str) fmt
 
   (*----------------------------------------------------------------------
   Rules that check if libraries define tests or benchs
@@ -754,10 +818,12 @@ end = struct
       let classic_libs = Mlbuild.classic_libs mlbuild in
       let lib = Lib.of_name (basename dir) in
       let lib_cmxa = dir ^/ Lib.suffixed_name lib ^ ".cmxa" in
+      let lib_cma = dir ^/ Lib.suffixed_name lib ^ ".cma" in
       compile_mls_in_dir_rules ~dir ~libraries ~external_libraries ~for_pack:(Some lib)
       *>>| fun (names, compile_mls_rules) ->
         List.concat
         [ [ Rule.default ~dir [Dep.path lib_cmxa] ]
+        ; [ Rule.default ~dir [Dep.path lib_cma] ]
         ; link_lib_rules ~dir ~external_libraries ~foreign_libraries ~lib_cmxa ~lib names
         ; compile_mls_rules
         ; inline_tests_rules ~dir ~libraries ~external_libraries ~foreign_libraries ~classic_libs ~names

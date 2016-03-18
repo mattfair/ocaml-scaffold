@@ -6,5 +6,11 @@
 *.cmo
 *.cmx
 *.cmxa
+*.cma
 *.exe
 *.o
+*.cmt
+*.cmti
+*.exe
+fgrep_tests.out
+inline_tests_runner*
