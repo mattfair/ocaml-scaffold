@@ -93,7 +93,7 @@ module Ocaml = struct
 
     let rules ~lib =
       let liblinks_dir = lib_dir_path ~lib in
-      List.map [".cmx"; ".cmi"; ".cmxa"; ".a"; ".o"] ~f:(fun suffix ->
+      List.map [".cmx"; ".cmi"; ".cmxa"; ".a"; ".o"; ".cma"] ~f:(fun suffix ->
         let file = (Lib.suffixed_name lib) ^ suffix in
         let link_file =
           let source = Lib.dir lib ^/ file in
@@ -440,7 +440,7 @@ module Ocaml = struct
     ksprintf (fun str -> bash ~dir str) fmt
 
 
-  let link_exe_rule ~dir ~libraries ~external_libraries ~foreign_libraries ~classic_libs ~exe names =
+  let link_exe_rule ~dir ~libraries ~external_libraries ~foreign_libraries ~classic_libs ~exe ~exe_byte names =
     let link_exe =
       Dep.all_unit (compiled_files_for ~dir names)
       *>>= fun () ->
@@ -470,7 +470,39 @@ module Ocaml = struct
                  ])
         ~ppx_args:[]
         in
-    Rule.create ~targets:[exe] link_exe
+    let link_byte_exe =
+      Dep.all_unit (compiled_files_for ~dir names)
+      *>>= fun () ->
+        transitive_libraries ~libraries
+      *>>= fun libraries ->
+        library_deps ~libraries
+      *>>= fun (lib_deps, `External lib_external_libraries) ->
+        let external_libraries =
+          String.Set.(to_list (of_list (external_libraries @ lib_external_libraries)))
+      in
+      let libraries =
+        let targets = String.Set.of_list (Hashtbl.keys lib_deps) in
+        List.map ~f:Lib.of_name (toposort ~targets lib_deps)
+      in
+      Liblinks.deps libraries ~suffixes:[".cma"]
+      *>>= fun () ->
+      toposort_deps ~dir (List.map names ~f:(fun name -> name ^ ".cmo"))
+      *>>| fun cmos ->
+        ocamlc ~dir ~external_libraries ~foreign_libraries
+        ~for_pack:None ~allow_unused_opens:false
+        ~include_dirs:(Liblinks.include_dirs ~dir libraries)
+        ~args:(List.concat
+                 [ List.map classic_libs ~f:(fun m -> m ^ ".cmxa")
+                 ; [ "-linkpkg"; "-o"; (basename exe_byte)]
+                 ; List.map libraries ~f:(fun lib -> Lib.suffixed_name lib ^ ".cma")
+                 ; cmos
+                 ])
+        ~ppx_args:[]
+    in
+    [
+        Rule.create ~targets:[exe] link_exe;
+        Rule.create ~targets:[exe_byte] link_byte_exe
+    ]
   
   let link_inline_tests_runner_exe_rule ~dir ~libraries ~external_libraries ~foreign_libraries ~classic_libs ~exe =
     let link_exe =
@@ -791,12 +823,14 @@ module Ocaml = struct
       let libraries = Mlbuild.libraries mlbuild in
       let classic_libs = Mlbuild.classic_libs mlbuild in
       let exe = dir ^/ (basename dir) ^ ".exe" in
+      let exe_byte = dir ^/ (basename dir) ^ ".byte.exe" in
       compile_mls_in_dir_rules ~dir ~libraries ~external_libraries ~for_pack:None
       *>>| fun (names, compile_mls_rules) ->
       List.concat
-        [ [ Rule.default ~dir [Dep.path exe]
-        ; link_exe_rule ~dir ~libraries ~external_libraries ~foreign_libraries ~classic_libs ~exe names
-        ]
+        [ [ Rule.default ~dir [Dep.path exe] ;
+            Rule.default ~dir [Dep.path exe_byte] ;
+          ]
+        ; link_exe_rule ~dir ~libraries ~external_libraries ~foreign_libraries ~classic_libs ~exe ~exe_byte names
         ; compile_mls_rules
         ])
   
