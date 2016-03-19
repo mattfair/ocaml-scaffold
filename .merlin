@@ -1,4 +1,4 @@
-PKG core core_kernel async async_extra jenga unix
+PKG core core_kernel async async_extra jenga unix ppx_jane ppx_inline_test
 EXT ounit custom_printf sexp
 FLG -I +camlp4 -w @a-3-4-29-40-41-42-44-45-48-27-39-32 -strict-sequence
 S .

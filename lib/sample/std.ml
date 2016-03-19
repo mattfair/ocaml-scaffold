@@ -10,6 +10,6 @@ let foo x = x + 5
 
 (* sample unit test *)
 open OUnit
-TEST_MODULE "value" = struct
-    TEST_UNIT = assert_equal (foo 5) 10
-end
+let%test_module "value" = (module struct
+    let%test_unit _ = assert_equal (foo 5) 10
+end)

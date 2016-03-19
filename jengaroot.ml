@@ -103,9 +103,11 @@ module Ocaml = struct
               Path.reach_from ~dir:liblinks_dir source
           in
           Action.process ~dir:liblinks_dir
-            ~prog:"ln" ~args:["-sf"; relative_source; "."]
-          in
-          Rule.create ~targets:[liblinks_dir ^/ file] link_file)
+            ~prog:"ln" ~args:["-sf"; relative_source; "."]()
+        in
+        Rule.create ~targets:[liblinks_dir ^/ file] (
+            link_file
+        ))
 
 
     let include_dirs ~dir libs =
@@ -114,21 +116,17 @@ module Ocaml = struct
   end
 
   let inline_testing_packages =
-    [ "pa_ounit"; "oUnit"; "core" ]
-
-  let pp_packages =
-    [ "camlp4"; "sexplib.syntax"; "bin_prot.syntax"; "herelib.syntax"
-  ; "fieldslib.syntax"; "comparelib.syntax"; "variantslib.syntax"
-  ; "pa_ounit.syntax" 
-    ]
+      [ "oUnit"; "ppx_jane"; "ppx_inline_test"; "core" ]
     
+  let ppx_args lib =
+      ["-predicates"; "ppx_driver"; "-package"; "ppx_inline_test"; "-ppx"; "ppx -inline-test-lib "^lib]
 
   let ocamlcompile ~dir ~external_libraries ~foreign_libraries ~for_pack
-        ~include_dirs ~args ~allow_unused_opens ~pp_args name =
+        ~include_dirs ~args ~allow_unused_opens ~ppx_args name =
           let packages_args  =
             match external_libraries with
       | [] -> []
-      | _  -> ["-package"; String.concat ~sep:"," ((pp_packages @ external_libraries) @ inline_testing_packages)]
+      | _  -> ["-package"; String.concat ~sep:"," (external_libraries @ inline_testing_packages)]
         in
     let pack_args =
       Option.value_map for_pack ~default:[]
@@ -153,32 +151,23 @@ module Ocaml = struct
       in
       ["-w"; String.concat ~sep:"-" ("@A" :: ignored_warnings)]
       in
-    let syntax_args =
-      ["-syntax"; "camlp4o"] @ pp_args
-    in
     let cmt_args =
       ["-bin-annot"; "-g"]
     in
     let args = (List.concat [ [name; "-thread"]; args; packages_args; pack_args; include_args
-                         ; foreign_args; warning_args; syntax_args; cmt_args]) in
-    Action.process ~dir ~prog:ocamlfind ~args
+                         ; foreign_args; warning_args; ppx_args; cmt_args]) in
+    Action.process ~dir ~prog:ocamlfind ~args ()
   
-  let ocamlopt ~dir ~external_libraries ~foreign_libraries ~for_pack ~include_dirs ~args ~allow_unused_opens ~pp_args =
-    ocamlcompile ~dir ~external_libraries ~foreign_libraries ~for_pack ~include_dirs ~args ~allow_unused_opens ~pp_args ocamlopt_prog
+  let ocamlopt ~dir ~external_libraries ~foreign_libraries ~for_pack ~include_dirs ~args ~allow_unused_opens ~ppx_args =
+    ocamlcompile ~dir ~external_libraries ~foreign_libraries ~for_pack ~include_dirs ~args ~allow_unused_opens ~ppx_args ocamlopt_prog
   
-  let ocamlc ~dir ~external_libraries ~foreign_libraries ~for_pack ~include_dirs ~args ~allow_unused_opens ~pp_args =
-    ocamlcompile ~dir ~external_libraries ~foreign_libraries ~for_pack ~include_dirs ~args ~allow_unused_opens ~pp_args ocamlc_prog 
+  let ocamlc ~dir ~external_libraries ~foreign_libraries ~for_pack ~include_dirs ~args ~allow_unused_opens ~ppx_args =
+    ocamlcompile ~dir ~external_libraries ~foreign_libraries ~for_pack ~include_dirs ~args ~allow_unused_opens ~ppx_args ocamlc_prog 
 
   let ocamldep ~dir ~args =
-    let packages_args =
-      ["-package"; String.concat ~sep:"," pp_packages]
-    in
-    let syntax_args =
-      ["-syntax"; "camlp4o"]
-    in
     Action.process ~dir ~prog:ocamlfind
-      ~args:(List.concat [ ["ocamldep"]; args; packages_args; syntax_args
-      ])
+      ~args:(List.concat [ ["ocamldep"]; args; 
+      ])()
   
 
   let glob_ml ~dir =
@@ -226,7 +215,7 @@ module Ocaml = struct
       external_libraries : string list sexp_option;
       foreign_libraries  : string list sexp_option;
       classic_libs      : string list sexp_option;
-    } with sexp
+    } [@@deriving sexp]
 
     let load ~dir =
       Dep.contents (dir ^/ "mlbuild")
@@ -263,13 +252,14 @@ module Ocaml = struct
   end
 
   let ocamldep_deps ~dir ~source =
+    let ppx = ppx_args (basename dir) in
     Dep.action_stdout
     (Dep.all_unit
        [ Dep.glob_change (glob_ml ~dir)
        ; Dep.glob_change (glob_mli ~dir)
        ; Dep.path source
     ]
-    *>>| fun () -> ocamldep ~dir ~args:["-native"; basename source])
+    *>>| fun () -> ocamldep ~dir ~args:(["-native"; basename source]@ppx))
     *>>| fun deps ->
       let deps = String.Search_pattern.(replace_all (create "\\\n") ~in_:deps ~with_:" ")
   in
@@ -401,7 +391,7 @@ module Ocaml = struct
     Action.process ~dir ~prog:"bash" ~args:[
       "-e"; "-u"; "-o"; "pipefail";
     "-c"; command_string
-    ]
+    ]()
 
   module Bash : sig
     type t
@@ -478,7 +468,7 @@ module Ocaml = struct
                  ; List.map libraries ~f:(fun lib -> Lib.suffixed_name lib ^ ".cmxa")
                  ; cmxs
                  ])
-        ~pp_args:[]
+        ~ppx_args:[]
         in
     Rule.create ~targets:[exe] link_exe
   
@@ -502,7 +492,7 @@ module Ocaml = struct
         let targets = String.Set.of_list (Hashtbl.keys lib_deps) in
         List.map ~f:Lib.of_name (toposort ~targets lib_deps)
         in
-      let pp_args = ["-ppopt"; "-pa-ounit-lib"; "-ppopt"; libname] in
+
       Liblinks.deps libraries ~suffixes:[".cmxa"; ".a"]
       *>>= fun () ->
       toposort_deps ~dir (List.map names ~f:(fun name -> name ^ ".cmx"))
@@ -517,7 +507,7 @@ module Ocaml = struct
                  ; List.map libraries ~f:(fun lib -> Lib.suffixed_name lib ^ ".cmxa")
                  ; cmxs
                  ])
-        ~pp_args
+        ~ppx_args:[]
         in
     Rule.create ~targets:[exe] link_exe
   
@@ -536,7 +526,7 @@ module Ocaml = struct
         ocamlopt ~dir ~external_libraries ~foreign_libraries
         ~include_dirs:[Path.to_string libpath] ~for_pack:None ~allow_unused_opens:false
         ~args:["-a"; "-o"; basename lib_cmxa; basename lib_cmx]
-        ~pp_args:[]
+        ~ppx_args:[]
     in
     let pack_lib_cmx =
       Dep.all_unit (compiled_files_for ~dir names)
@@ -548,7 +538,7 @@ module Ocaml = struct
                  [ ["-pack"; "-o"; basename lib_cmx]
                  ; cmxs
                  ])
-        ~pp_args:[]
+        ~ppx_args:[]
     in
     let pack_lib_cma =
       Dep.all_unit (compiled_files_for ~dir names)
@@ -561,7 +551,7 @@ module Ocaml = struct
                  [ ["-pack"; "-o"; basename lib_cma]
                  ; cmos
                  ])
-        ~pp_args:[]
+        ~ppx_args:[]
     in
     [ Rule.create ~targets:[lib_cmxa; lib_a] link_cmxa
     ; Rule.create ~targets:[lib_cmx; lib_cmi; lib_o] pack_lib_cmx
@@ -578,11 +568,10 @@ module Ocaml = struct
     *>>| fun () ->
       let lib = Lib.of_name (basename dir) in
       let libname = Lib.suffixed_name lib in
-      let pp_args = ["-thread"; "-ppopt"; "-pa-ounit-lib"; "-ppopt"; libname] in
       ocamlopt ~dir ~external_libraries ~include_dirs ~for_pack
       ~foreign_libraries:[] ~allow_unused_opens:false
       ~args:["-c"; basename ml]
-      ~pp_args
+      ~ppx_args:(ppx_args libname)
   
   let byte_compile_ml ~dir ~name ~external_libraries ~for_pack ~include_dirs ~cmo =
     let ml = dir ^/ name ^ ".ml" in
@@ -604,14 +593,13 @@ module Ocaml = struct
        bytecode compilation always happens in a subdirectory. *)
       let lib = Lib.of_name (basename dir) in
       let libname = Lib.suffixed_name lib in
-      let pp_args = ["-thread"; "-ppopt"; "-pa-ounit-lib"; "-ppopt"; libname] in
       ocamlc ~dir ~external_libraries ~include_dirs ~for_pack
       ~foreign_libraries:[] ~allow_unused_opens:false
       ~args:[
           "-o"; basename cmo;
           "-c"; basename ml; 
       ]
-      ~pp_args
+      ~ppx_args:(ppx_args libname)
       
 
   let byte_compile_ml_rule ~dir ~libraries ~external_libraries ~for_pack name =
@@ -654,7 +642,7 @@ module Ocaml = struct
         ocamlopt ~dir ~external_libraries ~for_pack ~include_dirs
         ~foreign_libraries:[] ~allow_unused_opens:true
         ~args:["-c"; basename mli]
-        ~pp_args:[]
+        ~ppx_args:[]
       in
       let compile_ml = compile_ml ~dir ~name ~external_libraries ~libraries ~for_pack ~include_dirs ~cmx in
       [ Rule.create ~targets:[cmx; o] compile_ml 
@@ -721,7 +709,7 @@ module Ocaml = struct
       )
 
   let fgrep_test_filename = "fgrep_tests.out"
-  let test_macros = ["TEST"; "TEST_UNIT"; "TEST_MODULE"]
+  let test_macros = ["let%test"; "let%test_unit"; "let%test_module"]
 
  (*----------------------------------------------------------------------
  inline_tests & benchmarks
@@ -731,12 +719,15 @@ module Ocaml = struct
      initialization code (which runs the tests) in an otherwise unused module *)
 
     write_string_rule ~target:(Path.relative ~dir "inline_tests_runner.ml")
-    (sprintf "let () = let module M = %s in Pa_ounit_lib.Runtime.summarize ()"
-       (String.capitalize libname));
+    ("let run_inline_tests () =\n" ^
+     "Ppx_inline_test_lib.Runtime.(summarize () |>\n"^
+     "                             Test_result.record;\n"^
+     "                             Test_result.exit ())"^
+    (sprintf "let () = let module M = %s in run_inline_tests (); "
+       (String.capitalize libname)));
 
     write_string_rule ~chmod_x:() ~target:(Path.relative ~dir "inline_tests_runner") 
     ("#!/bin/sh\\n# This file was generated, dont edit by hand\\ncd $(dirname $(readlink -f $0))\\nexec ./inline_tests_runner.exe inline-test-runner "^libname^" $@");
-
   ]
 
   let time_limit = Path.root_relative "bin/time_limit"
@@ -747,8 +738,8 @@ module Ocaml = struct
     Dep.action
     (Dep.all_unit (List.map sources ~f:Dep.path)
     *>>| fun () ->
-      Action.process ~dir ~prog:(Path.reach_from ~dir time_limit)
-      ~args:["300"; "./" ^ filename])
+      (Action.process ~dir ~prog:(Path.reach_from ~dir time_limit)
+      ~args:["300"; "./" ^ filename])())
 
   let run_inline_tests_action ~dir =
     run_inline_action ~dir "inline_tests_runner"
